@@ -3,10 +3,13 @@ package pkglib
 // Thin wrappers around git CLI invocations
 
 import (
+	"bufio"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -83,6 +86,49 @@ func (g git) isWorkTree(pkg string) (bool, error) {
 	return false, fmt.Errorf("unexpected output from git rev-parse --is-inside-work-tree: %s", tf)
 }
 
+func (g git) contentHash() (string, error) {
+	hash := sha256.New()
+	// list of files tracked by git that might have changed
+	trackedFiles, err := g.commandStdout(nil, "ls-files")
+	if err != nil {
+		return "", err
+	}
+	untrackedFiles, err := g.commandStdout(nil, "ls-files", "--exclude-standard", "--others")
+	if err != nil {
+		return "", err
+	}
+	allFiles := strings.Join([]string{trackedFiles, untrackedFiles}, "\n")
+	scanner := bufio.NewScanner(strings.NewReader(strings.TrimSpace(allFiles)))
+	for scanner.Scan() {
+		filename := filepath.Join(g.dir, scanner.Text())
+		info, err := os.Lstat(filename)
+		if err != nil {
+			log.Debugf("cannot stat %s: %s, skipped", filename, err)
+			continue
+		}
+		if info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			// we do not want to calculate hash of directory or symlinks
+			continue
+		}
+		f, err := os.Open(filename)
+		if err != nil {
+			log.Debugf("cannot open %s: %s, skipped", filename, err)
+			continue
+		}
+		if _, err := io.Copy(hash, f); err != nil {
+			_ = f.Close()
+			return "", err
+		}
+		if err = f.Close(); err != nil {
+			return "", err
+		}
+	}
+	if err = scanner.Err(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
 func (g git) treeHash(pkg, commit string) (string, error) {
 	// we have to check if pkg is at the top level of the git tree,
 	// if that's the case we need to use tree hash from the commit itself
@@ -104,12 +150,12 @@ func (g git) treeHash(pkg, commit string) (string, error) {
 	}
 
 	if out == "" {
-		return "", fmt.Errorf("Package %s is not in git", pkg)
+		return "", fmt.Errorf("package %s is not in git", pkg)
 	}
 
 	matches := treeHashRe.FindStringSubmatch(out)
 	if len(matches) != 2 {
-		return "", fmt.Errorf("Unable to parse ls-tree output: %q", out)
+		return "", fmt.Errorf("unable to parse ls-tree output: %q", out)
 	}
 
 	return matches[1], nil
@@ -134,29 +180,70 @@ func (g git) commitTag(commit string) (string, error) {
 }
 
 func (g git) isDirty(pkg, commit string) (bool, error) {
-	// If it isn't HEAD it can't be dirty
+	// Only makes sense to check for HEAD
 	if commit != "HEAD" {
 		return false, nil
 	}
 
-	// Update cache, otherwise files which have an updated
-	// timestamp but no actual changes are marked as changes
-	// because `git diff-index` only uses the `lstat` result and
-	// not the actual file contents. Running `git update-index
-	// --refresh` updates the cache.
-	if err := g.command("update-index", "-q", "--refresh"); err != nil {
+	// 1. Check for changes in tracked files (without using update-index)
+	// --no-ext-diff disables any external diff tool
+	// --exit-code makes it return 1 if differences are found
+	err := g.command("diff", "--no-ext-diff", "--exit-code", "--quiet", commit, "--", pkg)
+	if err != nil {
+		if _, ok := err.(*exec.ExitError); ok {
+			// Changes found in tracked files
+			return true, nil
+		}
+		// Some actual failure
 		return false, err
 	}
 
-	err := g.command("diff-index", "--quiet", commit, "--", pkg)
+	// 2. Check for untracked files
+	_, err = g.commandStdout(nil, "ls-files", "--exclude-standard", "--others", "--error-unmatch", "--", pkg)
 	if err == nil {
+		// Untracked files found
+		return true, nil
+	}
+	if _, ok := err.(*exec.ExitError); ok {
+		// No untracked files — clean
 		return false, nil
 	}
-	switch err.(type) {
-	case *exec.ExitError:
-		// diff-index exits with an error if there are differences
-		return true, nil
-	default:
-		return false, err
+	// Unexpected error
+	return false, err
+}
+
+// goPkgVersion return a version that is compliant with go package versioning.
+// This would either be:
+//
+// - The tag name if the most recent commit is tagged
+// - The structure <version>-<count>-<commmit> if the most recent commit is not tagged
+//
+// See https://go.dev/ref/mod for more information
+func (g git) goPkgVersion() (string, error) {
+	lastSemver, _ := g.commandStdout(nil, "--no-pager", "describe", "--match='v[0-9].[0-9].[0-9]*'", "--abbrev=0", "--tags")
+	if lastSemver == "" {
+		lastSemver = "v0.0.0"
 	}
+	commitList := "HEAD"
+	if lastSemver != "v0.0.0" {
+		commitList = fmt.Sprintf("%s..HEAD", lastSemver)
+	}
+	count, err := g.commandStdout(nil, "rev-list", commitList, "--count")
+	if err != nil {
+		return "", err
+	}
+	version := ""
+	if count == "0" {
+		version = lastSemver
+	} else {
+		dateCommit, err := g.commandStdout(nil, "--no-pager", "show", "--quiet", "--abbrev=12", "--date=format-local:%Y%m%d%H%M%S", "--format=%cd-%h")
+		if err != nil {
+			return "", err
+		}
+		version = fmt.Sprintf("%s-%s", lastSemver, dateCommit)
+	}
+
+	version = strings.TrimSpace(version)
+
+	return version, nil
 }

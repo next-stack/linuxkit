@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -43,7 +43,7 @@ func (p *ProviderScaleway) Probe() bool {
 	// Getting the conf should always work...
 	_, err := scalewayGet(scalewayMetadataURL + "conf")
 	if err != nil {
-		log.Printf(err.Error())
+		log.Print(err.Error())
 		return false
 	}
 
@@ -62,7 +62,7 @@ func (p *ProviderScaleway) Extract() ([]byte, error) {
 		return nil, fmt.Errorf("Scaleway: Failed to get hostname: %s", err)
 	}
 
-	err = ioutil.WriteFile(path.Join(ConfigPath, Hostname), hostname, 0644)
+	err = os.WriteFile(path.Join(ConfigPath, Hostname), hostname, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("Scaleway: Failed to write hostname: %s", err)
 	}
@@ -72,7 +72,7 @@ func (p *ProviderScaleway) Extract() ([]byte, error) {
 		return nil, fmt.Errorf("Scaleway: Failed to get instanceID: %s", err)
 	}
 
-	err = ioutil.WriteFile(path.Join(ConfigPath, instanceIDFile), instanceID, 0644)
+	err = os.WriteFile(path.Join(ConfigPath, instanceIDFile), instanceID, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("Scaleway: Failed to write instance_id: %s", err)
 	}
@@ -82,7 +82,7 @@ func (p *ProviderScaleway) Extract() ([]byte, error) {
 		return nil, fmt.Errorf("Scaleway: Failed to get instanceLocation: %s", err)
 	}
 
-	err = ioutil.WriteFile(path.Join(ConfigPath, instanceLocationFile), instanceLocation, 0644)
+	err = os.WriteFile(path.Join(ConfigPath, instanceLocationFile), instanceLocation, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("Scaleway: Failed to write instance_location: %s", err)
 	}
@@ -92,7 +92,7 @@ func (p *ProviderScaleway) Extract() ([]byte, error) {
 		// not an error
 		log.Printf("Scaleway: Failed to get publicIP: %s", err)
 	} else {
-		err = ioutil.WriteFile(path.Join(ConfigPath, publicIPFile), publicIP, 0644)
+		err = os.WriteFile(path.Join(ConfigPath, publicIPFile), publicIP, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("Scaleway: Failed to write public_ip: %s", err)
 		}
@@ -104,7 +104,7 @@ func (p *ProviderScaleway) Extract() ([]byte, error) {
 		return nil, fmt.Errorf("Scaleway: Failed to get privateIP: %s", err)
 	}
 
-	err = ioutil.WriteFile(path.Join(ConfigPath, privateIPFile), privateIP, 0644)
+	err = os.WriteFile(path.Join(ConfigPath, privateIPFile), privateIP, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("Scaleway: Failed to write private_ip: %s", err)
 	}
@@ -123,7 +123,7 @@ func (p *ProviderScaleway) Extract() ([]byte, error) {
 	return userData, nil
 }
 
-// exctractInformation returns the extracted information given as parameter from the metadata
+// extractInformation returns the extracted information given as parameter from the metadata
 func (p *ProviderScaleway) extractInformation(metadata []byte, information string) ([]byte, error) {
 	query := strings.ToUpper(information) + "="
 	for _, line := range bytes.Split(metadata, []byte("\n")) {
@@ -152,7 +152,7 @@ func scalewayGet(url string) ([]byte, error) {
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("Scaleway: Status not ok: %d", resp.StatusCode)
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("Scaleway: Failed to read http response: %s", err)
 	}
@@ -192,7 +192,7 @@ func scalewayGetUserdata() ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +225,7 @@ func (p *ProviderScaleway) handleSSH(metadata []byte) error {
 		return fmt.Errorf("Failed to create %s: %s", SSH, err)
 	}
 
-	err = ioutil.WriteFile(path.Join(ConfigPath, SSH, "authorized_keys"), []byte(rootKeys), 0600)
+	err = os.WriteFile(path.Join(ConfigPath, SSH, "authorized_keys"), []byte(rootKeys), 0600)
 	if err != nil {
 		return fmt.Errorf("Failed to write ssh keys: %s", err)
 	}

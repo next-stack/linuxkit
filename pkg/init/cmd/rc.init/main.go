@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"encoding/csv"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -26,8 +25,7 @@ const (
 )
 
 var (
-	rliminf  = unix.RLIM_INFINITY
-	infinity = uint64(rliminf)
+	infinity = uint64(unix.RLIM_INFINITY)
 )
 
 // set as a subreaper
@@ -82,7 +80,7 @@ func mkdir(path string, perm os.FileMode) {
 
 // list of all enabled cgroups
 func cgroupList() []string {
-	list := []string{}
+	var list []string
 	f, err := os.Open("/proc/cgroups")
 	if err != nil {
 		log.Printf("cannot open /proc/cgroups: %v", err)
@@ -110,7 +108,7 @@ func cgroupList() []string {
 
 // write a file, eg sysfs
 func write(path string, value string) {
-	err := ioutil.WriteFile(path, []byte(value), 0600)
+	err := os.WriteFile(path, []byte(value), 0600)
 	if err != nil {
 		log.Printf("cannot write to %s: %v", path, err)
 	}
@@ -118,7 +116,7 @@ func write(path string, value string) {
 
 // read a file, eg sysfs, strip whitespace, empty string if does not exist
 func read(path string) string {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
@@ -127,8 +125,8 @@ func read(path string) string {
 
 // read a directory
 func readdir(path string) []string {
-	names := []string{}
-	files, err := ioutil.ReadDir(path)
+	var names []string
+	files, err := os.ReadDir(path)
 	if err != nil {
 		log.Printf("cannot read directory %s: %v", path, err)
 		return names
@@ -227,9 +225,7 @@ func doMounts() {
 	// misc /proc mounted fs
 	mountSilent("binfmt_misc", "/proc/sys/fs/binfmt_misc", "binfmt_misc", noexec|nosuid|nodev, "")
 
-	if isCgroupV2() {
-		mount("cgroup2", "/sys/fs/cgroup", "cgroup2", noexec|nosuid|nodev, "")
-	} else {
+	if isCgroupV1() {
 		// mount cgroup root tmpfs
 		mount("cgroup_root", "/sys/fs/cgroup", "tmpfs", nodev|noexec|nosuid, "mode=755,size=10m")
 		// mount cgroups filesystems for all enabled cgroups
@@ -245,6 +241,8 @@ func doMounts() {
 		// many things assume systemd
 		mkdir("/sys/fs/cgroup/systemd", 0555)
 		mount("cgroup", "/sys/fs/cgroup/systemd", "cgroup", 0, "none,name=systemd")
+	} else {
+		mount("cgroup2", "/sys/fs/cgroup", "cgroup2", noexec|nosuid|nodev, "")
 	}
 
 	// make / rshared
@@ -425,14 +423,14 @@ func doShutdown(action string) {
 	os.Exit(0)
 }
 
-func isCgroupV2() bool {
+func isCgroupV1() bool {
 	dt, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
 		log.Printf("error reading /proc/cmdline: %v", err)
 		return false
 	}
-	for _, s := range strings.Split(string(dt), " ") {
-		if s == "linuxkit.unified_cgroup_hierarchy=1" {
+	for _, s := range strings.Fields(string(dt)) {
+		if s == "linuxkit.unified_cgroup_hierarchy=0" {
 			return true
 		}
 	}

@@ -5,23 +5,30 @@ import (
 	"crypto/rsa"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/docker/docker/pkg/term"
+	"context"
+
+	"github.com/moby/term"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 	"google.golang.org/api/storage/v1"
 )
 
-const pollingInterval = 500 * time.Millisecond
-const timeout = 300
+const (
+	pollingInterval = 500 * time.Millisecond
+	timeout         = 300
+
+	uefiCompatibleFeature = "UEFI_COMPATIBLE"
+	vmxImageLicence       = "projects/vm-options/global/licenses/enable-vmx"
+)
 
 // GCPClient contains state required for communication with GCP
 type GCPClient struct {
@@ -29,7 +36,6 @@ type GCPClient struct {
 	compute     *compute.Service
 	storage     *storage.Service
 	projectName string
-	fileName    string
 	privKey     *rsa.PrivateKey
 }
 
@@ -48,7 +54,7 @@ func NewGCPClient(keys, projectName string) (*GCPClient, error) {
 			return nil, err
 		}
 
-		jsonKey, err := ioutil.ReadAll(f)
+		jsonKey, err := io.ReadAll(f)
 		if err != nil {
 			return nil, err
 		}
@@ -82,12 +88,12 @@ func NewGCPClient(keys, projectName string) (*GCPClient, error) {
 	}
 
 	var err error
-	client.compute, err = compute.New(client.client)
+	client.compute, err = compute.NewService(ctx, option.WithHTTPClient(client.client))
 	if err != nil {
 		return nil, err
 	}
 
-	client.storage, err = storage.New(client.client)
+	client.storage, err = storage.NewService(ctx, option.WithHTTPClient(client.client))
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +114,7 @@ func (g GCPClient) UploadFile(src, dst, bucketName string, public bool) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	objectCall := g.storage.Objects.Insert(bucketName, &storage.Object{Name: dst}).Media(f)
 
@@ -125,8 +131,8 @@ func (g GCPClient) UploadFile(src, dst, bucketName string, public bool) error {
 	return nil
 }
 
-// CreateImage creates a GCP image using the a source from Google Storage
-func (g GCPClient) CreateImage(name, storageURL, family string, nested, replace bool) error {
+// CreateImage creates a GCP image using the source from Google Storage
+func (g GCPClient) CreateImage(name, storageURL, family string, nested, uefi, replace bool) error {
 	if replace {
 		if err := g.DeleteImage(name); err != nil {
 			return err
@@ -146,7 +152,13 @@ func (g GCPClient) CreateImage(name, storageURL, family string, nested, replace 
 	}
 
 	if nested {
-		imgObj.Licenses = []string{"projects/vm-options/global/licenses/enable-vmx"}
+		imgObj.Licenses = []string{vmxImageLicence}
+	}
+
+	if uefi {
+		imgObj.GuestOsFeatures = []*compute.GuestOsFeature{
+			{Type: uefiCompatibleFeature},
+		}
 	}
 
 	op, err := g.compute.Images.Insert(g.projectName, imgObj).Do()
@@ -185,7 +197,7 @@ func (g GCPClient) DeleteImage(name string) error {
 }
 
 // CreateInstance creates and starts an instance on GCP
-func (g GCPClient) CreateInstance(name, image, zone, machineType string, disks Disks, data *string, nested, replace bool) error {
+func (g GCPClient) CreateInstance(name, image, zone, machineType string, disks Disks, data *string, nested, vtpm, replace bool) error {
 	if replace {
 		if err := g.DeleteInstance(name, zone, true); err != nil {
 			return err
@@ -203,6 +215,34 @@ func (g GCPClient) CreateInstance(name, image, zone, machineType string, disks D
 	}
 	sshKey := new(string)
 	*sshKey = fmt.Sprintf("moby:%s moby", string(ssh.MarshalAuthorizedKey(k)))
+
+	// check provided image to be compatible with provided options
+	op, err := g.compute.Images.Get(g.projectName, image).Do()
+	if err != nil {
+		return err
+	}
+	uefiCompatible := false
+	for _, feature := range op.GuestOsFeatures {
+		if feature != nil && feature.Type == uefiCompatibleFeature {
+			uefiCompatible = true
+			break
+		}
+	}
+	if vtpm && !uefiCompatible {
+		return fmt.Errorf("cannot use vTPM without UEFI_COMPATIBLE image")
+	}
+	// we should check for nested
+	vmxLicense := false
+	for _, license := range op.Licenses {
+		// we omit hostname and version when define license
+		if strings.HasSuffix(license, vmxImageLicence) {
+			vmxLicense = true
+			break
+		}
+	}
+	if nested && !vmxLicense {
+		return fmt.Errorf("cannot use nested virtualization without enable-vmx image")
+	}
 
 	instanceDisks := []*compute.AttachedDisk{
 		{
@@ -227,7 +267,13 @@ func (g GCPClient) CreateInstance(name, image, zone, machineType string, disks D
 		} else {
 			diskSizeGb = int64(convertMBtoGB(disk.Size))
 		}
-		diskOp, err := g.compute.Disks.Insert(g.projectName, zone, &compute.Disk{Name: diskName, SizeGb: diskSizeGb}).Do()
+		diskObj := &compute.Disk{Name: diskName, SizeGb: diskSizeGb}
+		if vtpm {
+			diskObj.GuestOsFeatures = []*compute.GuestOsFeature{
+				{Type: uefiCompatibleFeature},
+			}
+		}
+		diskOp, err := g.compute.Disks.Insert(g.projectName, zone, diskObj).Do()
 		if err != nil {
 			return err
 		}
@@ -274,8 +320,10 @@ func (g GCPClient) CreateInstance(name, image, zone, machineType string, disks D
 	}
 
 	if nested {
-		// TODO(rn): We could/should check here if the image has nested virt enabled
 		instanceObj.MinCpuPlatform = "Intel Haswell"
+	}
+	if vtpm {
+		instanceObj.ShieldedInstanceConfig = &compute.ShieldedInstanceConfig{EnableVtpm: true}
 	}
 
 	// Don't wait for operation to complete!
@@ -330,7 +378,7 @@ func (g GCPClient) GetInstanceSerialOutput(instance, zone string) error {
 			}
 			return err
 		}
-		fmt.Printf(res.Contents)
+		fmt.Printf("%s\n", res.Contents)
 		next = res.Next
 		// When the instance has been stopped, Start and Next will both be 0
 		if res.Start > 0 && next == 0 {
@@ -348,8 +396,8 @@ func (g GCPClient) ConnectToInstanceSerialPort(instance, zone string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -382,33 +430,39 @@ func (g GCPClient) ConnectToInstanceSerialPort(instance, zone string) error {
 		break
 	}
 	if conn == nil {
-		return fmt.Errorf(err.Error())
+		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	session, err := conn.NewSession()
 	if err != nil {
 		return err
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("Unable to setup stdin for session: %v", err)
+		return fmt.Errorf("unable to setup stdin for session: %v", err)
 	}
-	go io.Copy(stdin, os.Stdin)
+	go func() {
+		_, _ = io.Copy(stdin, os.Stdin)
+	}()
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("Unable to setup stdout for session: %v", err)
+		return fmt.Errorf("unable to setup stdout for session: %v", err)
 	}
-	go io.Copy(os.Stdout, stdout)
+	go func() {
+		_, _ = io.Copy(os.Stdout, stdout)
+	}()
 
 	stderr, err := session.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("Unable to setup stderr for session: %v", err)
+		return fmt.Errorf("unable to setup stderr for session: %v", err)
 	}
-	go io.Copy(os.Stderr, stderr)
+	go func() {
+		_, _ = io.Copy(os.Stderr, stderr)
+	}()
 	/*
 		c := make(chan os.Signal, 1)
 		exit := make(chan bool, 1)
@@ -440,7 +494,9 @@ func (g GCPClient) ConnectToInstanceSerialPort(instance, zone string) error {
 			return err
 		}
 
-		defer term.RestoreTerminal(fd, oldState)
+		defer func() {
+			_ = term.RestoreTerminal(fd, oldState)
+		}()
 
 		winsize, err := term.GetWinsize(fd)
 		if err != nil {

@@ -83,7 +83,7 @@ func (f *fileLog) Dump(n string) {
 	}
 }
 
-// Symlinks to the log directory. This is useful if we are logging directly to tmpfs and now need to symlink from a permanent disk.
+// Symlink links to the log directory. This is useful if we are logging directly to tmpfs and now need to symlink from a permanent disk.
 func (f *fileLog) Symlink(path string) {
 	parent := filepath.Dir(path)
 	if err := os.MkdirAll(parent, 0755); err != nil {
@@ -100,7 +100,14 @@ type remoteLog struct {
 // Path returns the name of a FIFO connected to the logging daemon.
 func (r *remoteLog) Path(n string) string {
 	path := filepath.Join(r.fifoDir, n+".log")
+	// replicate behavior of os.Create(path) for a fileLog.
+	// if a file exists at the given path, os.Create will truncate it.
+	// syscall.Mkfifo on the other hand fails when a file exists at the given path.
+	if _, err := os.Stat(path); err == nil {
+		os.Remove(path)
+	}
 	if err := syscall.Mkfifo(path, 0600); err != nil {
+		log.Printf("failed to create fifo %s: %s", path, err)
 		return "/dev/null"
 	}
 	go func() {
@@ -175,7 +182,7 @@ func (r *remoteLog) Dump(n string) {
 	}
 }
 
-// Symlinks to the log directory. This is a no-op because there is no log directory.
+// Symlink links to the log directory. This is a no-op because there is no log directory.
 func (r *remoteLog) Symlink(path string) {
 	return
 }

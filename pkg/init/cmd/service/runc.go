@@ -2,12 +2,12 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -38,12 +38,12 @@ func runcInit(rootPath, serviceType string) int {
 	}
 
 	// get files; note ReadDir already sorts them
-	files, err := ioutil.ReadDir(rootPath)
+	files, err := os.ReadDir(rootPath)
 	if err != nil {
 		log.Fatalf("Cannot read files in %s: %v", rootPath, err)
 	}
 
-	tmpdir, err := ioutil.TempDir("", filepath.Base(rootPath))
+	tmpdir, err := os.MkdirTemp("", filepath.Base(rootPath))
 	if err != nil {
 		log.Fatalf("Cannot create temporary directory: %v", err)
 	}
@@ -63,10 +63,40 @@ func runcInit(rootPath, serviceType string) int {
 	}
 
 	logger := GetLog(logDir)
+	v2, err := isCgroupV2()
+	if err != nil {
+		log.Fatalf("Cannot determine cgroup version: %v", err)
+	}
+	msg := "cgroup v1"
+	if v2 {
+		msg = "cgroup v2"
+	}
+	log.Printf("Using %s", msg)
+
+	// did we choose to run in debug mode? If so, runc will be in debug, and all messages will go to stdout/stderr in addition to the log
+	var runcDebugMode, runcConsoleMode bool
+	dt, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		log.Fatalf("error reading /proc/cmdline: %v", err)
+	}
+
+	debugLogger := log.New()
+	debugLogger.Level = log.InfoLevel
+
+	for _, s := range strings.Fields(string(dt)) {
+		if s == "linuxkit.runc_debug=1" {
+			runcDebugMode = true
+			debugLogger.Level = log.DebugLevel
+		}
+		if s == "linuxkit.runc_console=1" {
+			runcConsoleMode = true
+		}
+	}
 
 	for _, file := range files {
 		name := file.Name()
 		path := filepath.Join(rootPath, name)
+		log.Printf("%s %s: from %s", serviceType, name, path)
 
 		runtimeConfig := getRuntimeConfig(path)
 
@@ -75,8 +105,13 @@ func runcInit(rootPath, serviceType string) int {
 			status = 1
 			continue
 		}
+		debugLogger.Debugf("%s %s: creating", serviceType, name)
 		pidfile := filepath.Join(tmpdir, name)
-		cmd := exec.Command(runcBinary, "create", "--bundle", path, "--pid-file", pidfile, name)
+		cmdArgs := []string{"create", "--bundle", path, "--pid-file", pidfile, name}
+		if runcDebugMode {
+			cmdArgs = append([]string{"--debug"}, cmdArgs...)
+		}
+		cmd := exec.Command(runcBinary, cmdArgs...)
 
 		stdoutLog := serviceType + "." + name + ".out"
 		stdout, err := logger.Open(stdoutLog)
@@ -99,13 +134,22 @@ func runcInit(rootPath, serviceType string) int {
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
 
+		// if in console mode, send output to stdout/stderr instead of the log
+		// do not try io.MultiWriter(os.Stdout, stdout) as console messages will hang.
+		// it is not clear why, but since this is all for debugging anyways, it doesn't matter
+		// much.
+		if runcConsoleMode {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+		}
+
 		if err := cmd.Run(); err != nil {
 			log.Printf("Error creating %s: %v", name, err)
 			status = 1
 			// skip cleanup on error for debug
 			continue
 		}
-		pf, err := ioutil.ReadFile(pidfile)
+		pf, err := os.ReadFile(pidfile)
 		if err != nil {
 			log.Printf("Cannot read pidfile: %v", err)
 			status = 1
@@ -118,6 +162,7 @@ func runcInit(rootPath, serviceType string) int {
 			continue
 		}
 
+		debugLogger.Debugf("%s %s: preparing", serviceType, name)
 		if err := prepareProcess(pid, runtimeConfig); err != nil {
 			log.Printf("Cannot prepare process: %v", err)
 			status = 1
@@ -135,7 +180,12 @@ func runcInit(rootPath, serviceType string) int {
 			waitFor <- state
 		}()
 
-		cmd = exec.Command(runcBinary, "start", name)
+		debugLogger.Debugf("%s %s: starting", serviceType, name)
+		cmdArgs = []string{"start", name}
+		if runcDebugMode {
+			cmdArgs = append([]string{"--debug"}, cmdArgs...)
+		}
+		cmd = exec.Command(runcBinary, cmdArgs...)
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
 
@@ -145,8 +195,10 @@ func runcInit(rootPath, serviceType string) int {
 			continue
 		}
 
+		debugLogger.Debugf("%s %s: waiting for completion", serviceType, name)
 		_ = <-waitFor
 
+		debugLogger.Debugf("%s %s: cleaning up", serviceType, name)
 		cleanup(path)
 		_ = os.Remove(pidfile)
 
@@ -155,6 +207,7 @@ func runcInit(rootPath, serviceType string) int {
 		// once that is fixed, this can be cleaned up
 		logger.Dump(stdoutLog)
 		logger.Dump(stderrLog)
+		debugLogger.Debugf("%s %s: complete", serviceType, name)
 	}
 
 	_ = os.RemoveAll(tmpdir)

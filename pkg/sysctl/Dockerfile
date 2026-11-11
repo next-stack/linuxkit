@@ -1,11 +1,14 @@
-FROM linuxkit/alpine:0c069d0fd7defddb6e03925fcd4915407db0c9e1 AS mirror
+# Dockerfile to build linuxkit/sysctl for linuxkit
+FROM linuxkit/alpine:7f3944798557de5518a56e3437d7ed982701f224 AS mirror
 
 RUN apk add --no-cache go musl-dev
-ENV GOPATH=/go PATH=$PATH:/go/bin GO111MODULE=off
+ARG GOPKGVERSION
+ENV ldflags="-X main.Version=$GOPKGVERSION"
+ENV GOPATH=/go PATH=$PATH:/go/bin
 # Hack to work around an issue with go on arm64 requiring gcc
 RUN [ $(uname -m) = aarch64 ] && apk add --no-cache gcc || true
 
-COPY main.go /go/src/sysctl/
+COPY . /go/src/sysctl/
 RUN go-compile.sh /go/src/sysctl
 
 FROM scratch

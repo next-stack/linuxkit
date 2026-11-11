@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,7 +19,7 @@ import (
 	"github.com/scaleway/scaleway-sdk-go/scw"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var (
@@ -46,8 +45,7 @@ type ScalewayClient struct {
 func NewScalewayClient(accessKey, secretKey, zone, organizationID string) (*ScalewayClient, error) {
 	log.Debugf("Connecting to Scaleway")
 
-	scwOptions := []scw.ClientOption{}
-
+	var scwOptions []scw.ClientOption
 	if accessKey == "" || secretKey == "" {
 		config, err := scw.LoadConfig()
 		if err != nil {
@@ -114,7 +112,7 @@ func (s *ScalewayClient) getImageID(imageName, commercialType, arch string) (str
 			}
 		}
 	}
-	return "", errors.New("No image matching given requests")
+	return "", errors.New("no image matching given requests")
 }
 
 // CreateInstance create an instance with one additional volume
@@ -187,7 +185,7 @@ func (s *ScalewayClient) GetSecondVolumeID(instanceID string) (string, error) {
 
 	secondVolume, ok := serverResp.Server.Volumes["1"]
 	if !ok {
-		return "", errors.New("No second volume found")
+		return "", errors.New("no second volume found")
 	}
 
 	return secondVolume.ID, nil
@@ -244,7 +242,9 @@ func (s *ScalewayClient) BootInstanceAndWait(instanceID string) error {
 		for {
 			conn, err := net.Dial("tcp", dest)
 			if err == nil {
-				defer conn.Close()
+				defer func() {
+					_ = conn.Close()
+				}()
 				break
 			} else {
 				time.Sleep(1 * time.Second)
@@ -277,16 +277,16 @@ func getSSHAuth(sshKeyPath string) (ssh.Signer, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
-	buf, err := ioutil.ReadAll(f)
+	buf, err := io.ReadAll(f)
 	if err != nil {
 		return nil, err
 	}
 	signer, err := ssh.ParsePrivateKey(buf)
 	if err != nil {
 		fmt.Print("Enter ssh key passphrase: ")
-		bytePassword, err := terminal.ReadPassword(int(syscall.Stdin))
+		bytePassword, err := term.ReadPassword(int(syscall.Stdin))
 		// ReadPassword eats newline, put it back to avoid mangling logs
 		fmt.Println()
 		if err != nil {
@@ -336,16 +336,20 @@ func (s *ScalewayClient) CopyImageToInstance(instanceID, path, sshKeyPath string
 	if err != nil {
 		return err
 	}
-	defer session.Close()
+	defer func() {
+		_ = session.Close()
+	}()
 
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		_ = f.Close()
+	}()
 
 	// code taken from bramvdbogaerde/go-scp
-	contentBytes, err := ioutil.ReadAll(f)
+	contentBytes, err := io.ReadAll(f)
 	if err != nil {
 		return err
 	}
@@ -358,13 +362,13 @@ func (s *ScalewayClient) CopyImageToInstance(instanceID, path, sshKeyPath string
 		if err != nil {
 			return
 		}
-		defer w.Close()
-		fmt.Fprintln(w, "C0600", int64(len(contentBytes)), base)
-		io.Copy(w, bytesReader)
-		fmt.Fprintln(w, "\x00")
+		defer func() { _ = w.Close() }()
+		_, _ = fmt.Fprintln(w, "C0600", int64(len(contentBytes)), base)
+		_, _ = io.Copy(w, bytesReader)
+		_, _ = fmt.Fprintln(w, "\x00")
 	}()
 
-	session.Run("/usr/bin/scp -t /root/") // TODO remove hardcoded remote path?
+	_ = session.Run("/usr/bin/scp -t /root/") // TODO remove hardcoded remote path?
 	return err
 }
 
@@ -388,7 +392,7 @@ func (s *ScalewayClient) WriteImageToVolume(instanceID, deviceName string) error
 	if err != nil {
 		return err
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	var ddPathBuf bytes.Buffer
 	session.Stdout = &ddPathBuf
@@ -402,7 +406,7 @@ func (s *ScalewayClient) WriteImageToVolume(instanceID, deviceName string) error
 	if err != nil {
 		return err
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	ddCommand := strings.Trim(ddPathBuf.String(), " \n")
 	command := fmt.Sprintf("%s if=%s of=%s", ddCommand, s.fileName, deviceName)
@@ -551,7 +555,7 @@ func (s *ScalewayClient) CreateLinuxkitInstance(instanceName, imageName, instanc
 		return "", err
 	}
 	if len(imageResp.Images) != 1 {
-		return "", fmt.Errorf("Image %s not found or found multiple times", imageName)
+		return "", fmt.Errorf("image %s not found or found multiple times", imageName)
 	}
 	imageID := imageResp.Images[0].ID
 
@@ -591,7 +595,7 @@ func (s *ScalewayClient) ConnectSerialPort(instanceID string) error {
 	case scw.ZoneNlAms1:
 		gottyURL = "https://tty-ams1.scaleway.com/"
 	default:
-		return errors.New("Instance have no region")
+		return errors.New("instance have no region")
 	}
 
 	fullURL := fmt.Sprintf("%s?arg=%s&arg=%s", gottyURL, s.secretKey, instanceID)
@@ -617,7 +621,7 @@ func (s *ScalewayClient) ConnectSerialPort(instanceID string) error {
 	go func() {
 		err = gottyClient.Loop()
 		if err != nil {
-			fmt.Printf("ERROR: " + err.Error())
+			fmt.Printf("ERROR: %v\n", err)
 		}
 		//gottyClient.Close()
 		done <- true

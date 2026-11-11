@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"strings"
 
-	dockertypes "github.com/docker/docker/api/types"
-	"github.com/estesp/manifest-tool/pkg/registry"
-	"github.com/estesp/manifest-tool/pkg/types"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/linuxkit/linuxkit/src/cmd/linuxkit/util"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -24,9 +26,13 @@ var platformsToSearchForIndex = []string{
 }
 
 // PushManifest create a manifest that supports each of the provided platforms and push it out.
-func PushManifest(img string, auth dockertypes.AuthConfig) (hash string, length int, err error) {
-	srcImages := []types.ManifestEntry{}
+func PushManifest(img string, options ...remote.Option) (hash string, length int64, err error) {
+	baseRef, err := name.ParseReference(img)
+	if err != nil {
+		return hash, length, fmt.Errorf("parsing %s: %w", img, err)
+	}
 
+	adds := make([]mutate.IndexAddendum, 0, len(platformsToSearchForIndex))
 	for i, platform := range platformsToSearchForIndex {
 		osArchArr := strings.Split(platform, "/")
 		if len(osArchArr) != 2 && len(osArchArr) != 3 {
@@ -37,23 +43,66 @@ func PushManifest(img string, auth dockertypes.AuthConfig) (hash string, length 
 		if len(osArchArr) == 3 {
 			variant = osArchArr[2]
 		}
-		srcImages = append(srcImages, types.ManifestEntry{
-			Image: fmt.Sprintf("%s-%s", img, arch),
-			Platform: ocispec.Platform{
-				OS:           os,
-				Architecture: arch,
-				Variant:      variant,
-			},
+		refName := fmt.Sprintf("%s-%s", img, arch)
+		ref, err := name.ParseReference(refName)
+		if err != nil {
+			return hash, length, fmt.Errorf("parsing %s: %w", refName, err)
+		}
+		remoteDesc, err := GetRemote().Get(ref, options...)
+		if err != nil {
+			// TODO: Should distinguish between a 404 and a network error
+			log.Warnf("image %s not found; skipping: %v", ref, err)
+			continue
+		}
+		img, err := remoteDesc.Image()
+		if err != nil {
+			return hash, length, fmt.Errorf("getting image %s: %w", ref, err)
+		}
+		desc := remoteDesc.Descriptor
+		desc.Platform = &v1.Platform{
+			OS:           os,
+			Architecture: arch,
+			Variant:      variant,
+		}
+		adds = append(adds, mutate.IndexAddendum{
+			Add:        img,
+			Descriptor: desc,
 		})
 	}
 
-	yamlInput := types.YAMLInput{
-		Image:     img,
-		Manifests: srcImages,
+	// add the desc to the index we will push
+	index := mutate.AppendManifests(empty.Index, adds...)
+	// base index with which we are working
+	// get the existing index, if any
+	desc, err := GetRemote().Get(baseRef, options...)
+	if err == nil && desc != nil {
+		ii, err := desc.ImageIndex()
+		if err != nil {
+			return hash, length, fmt.Errorf("could not get index for existing reference %s: %w", img, err)
+		}
+		index, err = util.AppendIndex(index, ii)
+		if err != nil {
+			return hash, length, fmt.Errorf("could not append existing index for %s: %w", img, err)
+		}
 	}
 
-	log.Debugf("pushing manifest list for %s -> %#v", img, yamlInput)
-
-	// push the manifest list with the auth as given, ignore missing, do not allow insecure
-	return registry.PushManifestList(auth.Username, auth.Password, yamlInput, true, false, false, "")
+	size, err := index.Size()
+	if err != nil {
+		return hash, length, fmt.Errorf("getting index size: %w", err)
+	}
+	dig, err := index.Digest()
+	if err != nil {
+		return hash, length, fmt.Errorf("getting index digest: %w", err)
+	}
+	// if it is unchanged, do nothing
+	if desc != nil && desc.Digest == dig {
+		log.Debugf("not pushing manifest list for %s, unchanged", img)
+		return dig.String(), size, nil
+	}
+	log.Debugf("pushing manifest list for %s -> %#v", img, index)
+	err = remote.WriteIndex(baseRef, index, options...)
+	if err != nil {
+		return hash, length, fmt.Errorf("writing index: %w", err)
+	}
+	return dig.String(), size, nil
 }

@@ -1,4 +1,4 @@
-gummiboot
+bcc-lua
 libunwind-dev
 luajit-dev
 open-vm-tools
@@ -9,3 +9,5 @@ open-vm-tools-vmbackup
 ovmf
 strace
 syslinux
+systemd-boot
+systemd-efistub

@@ -1,12 +1,13 @@
 kernel:
-  image: linuxkit/kernel:5.10.47
+  image: linuxkit/kernel:6.18.60
   cmdline: "console=ttyS0 console=ttyAMA0"
 init:
-  - linuxkit/init:43c52456571369d62882605e4d510f0df3ed93de
-  - linuxkit/runc:5f9941eed05f58293f928c9f2f0b6a3f9f6f55c1
+  - linuxkit/init:075ff447b68e23feef95589c90010a039533e5b5
+  - linuxkit/runc:9442aa234715e751a16144f1d4ae3fd1a00fd492
 onboot:
   - name: metadata
-    image: linuxkit/metadata:a18ef20139eba44a80e1213c746471dc67d1b023
+    image: linuxkit/metadata:4bbf406678d376e1ae9c9efae6ca2421f63fb4ff
+    command: ["/usr/bin/metadata", "-v"]    
   - name: test
     image: alpine:3.13
     binds:
@@ -14,7 +15,7 @@ onboot:
       - /run:/run
     command: ["sh", "./check.sh"]
   - name: poweroff
-    image: linuxkit/poweroff:afe4b3ab865afe1e3ed5c88e58f57808f4f5119f
+    image: linuxkit/poweroff:4059858a555bed90c2280fa9b060b7a8f8de6d45
     command: ["/bin/sh", "/poweroff.sh", "10"]
 files:
   - path: check.sh

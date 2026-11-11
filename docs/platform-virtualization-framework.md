@@ -1,0 +1,315 @@
+# LinuxKit with Virtualization.Framework (macOS)
+
+We recommend using LinuxKit in conjunction with
+[Docker for Mac](https://docs.docker.com/docker-for-mac/install/). For
+the time being it's best to be on the latest edge release. `linuxkit
+run` uses [Virtualization.Framework](https://developer.apple.com/documentation/virtualization) and
+[VPNKit](https://github.com/moby/vpnkit) and the edge release ships
+with updated versions of both.
+
+Alternatively, you can install Virtualization.Framework and VPNKit standalone and use it without Docker for Mac.
+
+Virtualization.Framework is enabled on macOS only when built with CGO enabled.
+
+## Boot
+
+The Virtualization.Framework backend currently supports booting:
+- `kernel+initrd` output from `linuxkit build`.
+- `kernel+squashfs` output from `linuxkit build`.
+- EFI ISOs using the EFI firmware.
+
+You need to select the boot method manually using the command line
+options. The default is `kernel+initrd`. `kernel+squashfs` can be
+selected using `-squashfs` and to boot a ISO with EFI you have to
+specify `--iso --uefi`.
+
+The `kernel+initrd` uses a RAM disk for the root filesystem. If you
+have RAM constraints or large images we recommend using either the
+`kernel+squashfs` or the EFI ISO boot.
+
+For `kernel+initrd`, the backend accepts an uncompressed kernel or a
+plain gzip-compressed kernel. It also unwraps ARM64 EFI zboot kernels
+whose payload uses gzip, and checks for the ARM64 Linux Image magic in
+the decoded payload. Other EFI zboot compression formats return an
+unsupported-compression error. Decoded zboot and plain gzip kernels are
+limited to 1 GiB.
+
+## Console
+
+With `linuxkit run` on Virtualization.Framework the serial console is redirected to
+stdio, providing interactive access to the VM. The output of the VM
+can be re-directed to a file or pipe, but then stdin is not available.
+Virtualization.Framework does not provide a console device.
+
+## Host microphone input
+
+This section applies to the LinuxKit CLI Virtualization.Framework backend and its custom Linux guests.
+It does not enable microphone input for the Docker Desktop backend.
+
+On macOS 12 or later, `linuxkit run virtualization` passes the host's default microphone input to the VM by default.
+Use `--audio-input=false` to disable host microphone configuration and permission checks.
+
+On first use, macOS asks for microphone access; the prompt may name `linuxkit` or the launching app, such as Terminal.
+Grant or review access in System Settings > Privacy & Security > Microphone.
+If access is denied or restricted, or the executable lacks its microphone usage description, the command exits before starting the VM.
+
+Build and sign the macOS CLI from `src/cmd/linuxkit`, for example:
+
+```sh
+make GOOS=darwin GOARCH=arm64 local-build sign
+```
+
+The Darwin Make target embeds `linuxkit.Info.plist` and signs the executable with `linuxkit.entitlements`, including the audio input entitlement.
+
+The Linux guest kernel needs `CONFIG_SND_VIRTIO=y`, or `CONFIG_SND_VIRTIO=m` with `virtio_snd` loaded, for virtio sound support.
+For Compose services launched by `dockerd` inside the guest, pass the guest sound devices through to the service:
+
+```yaml
+services:
+  recorder:
+    devices:
+      - /dev/snd:/dev/snd
+```
+
+Local integration testing on an ARM64 Mac used LinuxKit 6.12.59, the #4226 changes, and a separate experimental guest `virtio-snd` patch.
+After three switches from AirPods to the built-in input, the first six-second guest capture in each cycle matched the host reference bit for bit; six VM shutdown cycles completed without a callback panic.
+These results do not verify the standalone stock-kernel configuration.
+
+The stock guest driver stalled after repeated short Virtualization.framework capture completions in local testing.
+The experimental patch stages returned audio bytes, bounds outstanding capture requests against ring capacity, and fixes request teardown and restart handling.
+Its test image uses `virtio_snd.capture_staging=1` and `virtio_snd.capture_packed_status=1`; these options are not part of the upstream Linux driver or this CLI change.
+
+The latest repeated-recording and 65-second acceptance suites did not all pass under host load and input changes.
+One reference comparison coincided with a 744-frame host ADC timestamp jump, and the 65-second run saw an unexpected default-input switch.
+Reliable lossless long-running capture remains unverified; input-switch testing opened a fresh recorder after stopping the interrupted one, so seamless switching during an active recording is also unverified.
+
+On the tested Mac, enabling the Codex Audio visualizer reproduced a CoreAudio startup hang; disabling it restored capture without restarting the audio service.
+This CLI change does not resolve that host-side interaction.
+
+
+## Disks
+
+The Virtualization.Framework backend support configuring a persistent disk using the
+standard `linuxkit` `-disk` syntax.  Multiple disks are
+supported and the disks are in raw format.
+
+## Power management
+
+On the first SIGTERM or SIGINT, the runner requests a graceful shutdown
+through Virtualization.Framework, which delivers a guest power-button event.
+On Apple Silicon, this uses a PL061 GPIO controller and a `gpio-keys` input
+device. The ARM64 kernel needs `CONFIG_GPIO_PL061=y`,
+`CONFIG_KEYBOARD_GPIO=y`, and `CONFIG_INPUT_EVDEV=y`.
+The guest must also run the [`acpid` package](../pkg/acpid), whose BusyBox
+event handler invokes `poweroff` to request an orderly shutdown from init.
+BusyBox acpid executes `/etc/acpi/PWRF/00000080` for this event. The handler
+invokes `/sbin/poweroff` by its applet name so BusyBox selects the shutdown
+operation. A symlink from `00000080` to the BusyBox binary would use the
+unrecognized applet name `00000080`.
+
+Run the package event-dispatch regression test from the repository root:
+
+```sh
+RT_PROJECT_ROOT="$PWD/test/cases" RT_LIB=/dev/null \
+  ./test/cases/040_packages/001_acpid/test.sh
+```
+
+The test builds a LinuxKit OS image with the published acpid package and boots it with QEMU.
+Inside the guest, it checks the handler's ownership and permissions and feeds
+a binary power-button event to acpid through a private FIFO. The handler
+signals the guest's real init, and the host test checks event dispatch and
+completed guest poweroff. A timeout or nonzero VM exit fails the test.
+The input-event fixture supports amd64 and arm64 guests.
+The test does not use host input devices or exercise the VZ GPIO controller;
+the platform-specific power-button path needs the separate VZ check below.
+An example of including the service is available in the
+[Docker for Mac example](../examples/docker-for-mac.yml).
+
+Use an acpid image built with the power-button handler and a kernel built
+with these options; older pinned images do not acquire the changes automatically.
+A successful shutdown request means the event was requested, rather than
+confirmation that the guest has completed shutdown. If the VM keeps running,
+check `/proc/bus/input/devices` for `gpio-keys` and `/var/log/acpid.log`
+for event-handler errors.
+
+The default acpid power-button handler also applies on other platforms using
+the rebuilt package. A power-button press that previously had no executable
+handler now requests shutdown. Custom power policies can use an acpid action
+mapping in `/etc/acpid.conf` and a corresponding handler under `/etc/acpi`.
+
+The runner's wait does not extend the guest's process shutdown grace period.
+LinuxKit init runs `/etc/shutdown.d`, sends SIGTERM to the remaining processes,
+waits five seconds, then sends SIGKILL before syncing and unmounting filesystems.
+Applications that need longer to flush data should be stopped and their writes
+completed before requesting VM shutdown. Orderly VM shutdown alone does not
+guarantee that an active recording or database transaction has been saved.
+
+After the first signal, the runner waits for the VM to stop naturally
+without an automatic timeout. A declined shutdown request or request
+error is logged, and the runner keeps waiting. A request error is
+preserved and returned when supervision ends if the runner observes it.
+A second SIGTERM or SIGINT skips the wait and starts a forced stop
+immediately, even if the graceful request is still pending. The
+forced-stop operation is bounded to 5 seconds; an unresolved error or
+timeout causes `linuxkit run` to exit unsuccessfully.
+
+A forced stop ends the VM without giving the guest a chance to shut down
+cleanly and may lose pending guest writes. Virtualization.Framework
+supports forced stop on macOS 12 and later. On macOS 11, a forced-stop
+attempt returns an unsupported macOS version error.
+
+## Networking
+
+By default, `linuxkit run` creates a VM with a single network
+interface which, logically, is attached to a L2 bridge. The bridge
+also has the VM used by Docker for Mac attached to it. This means that
+the LinuxKit VMs, created with `linuxkit run`, can be accessed from
+containers running on Docker for Mac.
+
+The LinuxKit VMs have IP addresses on the `192.168.65.0/24` subnet
+assigned by a DHCP server part of VPNKit. `192.168.65.1` is reserved
+for VPNKit as the default gateway and `192.168.65.2` is used by the
+Docker for Mac VM.
+
+By default, LinuxKit VMs get incrementally increasing IP addresses,
+but you can assign a fixed IP address with `linuxkit run -ip`. It's
+best to choose an IP address from the DHCP address range above, but
+care must be taken to avoid clashes of IP address.
+
+*NOTE:* The LinuxKit VMs can *not* be directly accessed by IP address
+from the host.  Enabling this would require use of the macOS `vmnet`
+framework, which requires the VMs to run as `root`.  We don't consider
+this option palatable, and provide alternative options to access the
+VMs over the network below.
+
+
+### Accessing network services
+
+Virtualization.Framework offers a number of ways for accessing network services
+running inside the LinuxKit VM from the host. These depend on the
+networking mode selected via `-networking`. The default mode is
+`vmnet`, where it sets up a network bridge. We intend to add support for
+`docker-for-mac`, where the same VPNkit instance is shared between
+LinuxKit VMs and the VM running as part of Docker for Mac, in the future.
+
+#### Access from the Docker for Mac VM (`-networking docker-for-mac`)
+
+The simplest way to access networking services exposed by a LinuxKit
+VM is to use a Docker for Mac container. For example, to access an ssh
+server in a LinuxKit VM, create a ssh client container from:
+
+```
+FROM alpine:edge
+RUN apk add --no-cache openssh-client
+```
+
+and then run
+
+```
+docker build -t ssh .
+docker run --rm -ti -v ~/.ssh:/root/.ssh  ssh ssh <IP address of VM>
+```
+
+#### Forwarding ports with `socat`  (`-networking docker-for-mac`)
+
+A `socat` container on Docker for Mac can be used to proxy between the
+LinuxKit VM's ports and localhost.  For example, to expose the redis
+port from the [RedisOS example](../examples/redis-os.yml), use this
+Dockerfile:
+
+```
+FROM alpine:edge
+RUN apk add --no-cache socat
+ENTRYPOINT [ "/usr/bin/socat" ]
+```
+and then:
+```
+docker build -t socat .
+docker run --rm -t -d -p 6379:6379 socat tcp-listen:6379,reuseaddr,fork tcp:<IP address of VM>:6379
+```
+
+#### Port forwarding with VPNKit (`-networking docker-for-mac`)
+
+There is **experimental** support for exposing selected ports of the
+guest on `localhost` using the `-publish` command line option. For
+example, using `-publish 2222:22/tcp` exposes the guest TCP port 22 on
+localhost on port 2222. Multiple `-publish` options can be
+specified. For example, the image build from the [`sshd
+example`](../examples/sshd.yml) can be started with:
+
+```
+linuxkit run -publish 2222:22/tcp sshd
+```
+
+and then you can log into the LinuxKit VM with `ssh -p 2222
+root@localhost`.
+
+Note, this mode is **experimental** and may cause the VPNKit instance
+shared with Docker for Mac being confused about which ports are
+currently in use, in particular if the LinuxKit VM does not exit
+gracefully. This can typically be fixed by restarting Docker for Mac.
+
+
+#### Port forwarding with VPNKit (`-networking vpnkit`)
+
+An alternative to the previous method is to start your own copy of
+`vpnkit` (or connect to an already running instance). This can be done
+using the `-networking vpnkit` command line option.
+
+VPNKit uses a 9P mount in `/port` for coordination between
+components. The first VM on a VPNKit instance currently needs mount
+the 9P filesystem and also needs to run the `vpnkit-forwarder` service
+to enable port forwarding to localhost.  A full example with `vpnkit`
+forwarding of `sshd` is available in
+[examples/vpnkit-forwarder.yml](/examples/vpnkit-forwarder.yml).
+
+To run this example with its own instance of VPNKit, use:
+
+```
+linuxkit run -networking vpnkit -publish 2222:22/tcp vpnkit-forwarder
+```
+
+You can then access it via:
+
+```
+ssh -p 2222 root@localhost
+```
+
+More details about the VPNKit forwarding mechanism is available in the
+[VPNKit
+documentation](https://github.com/moby/vpnkit/blob/master/docs/ports.md#signalling-from-the-vm-to-the-host).
+
+
+## Integration services and Metadata
+
+There are no special integration services available for Virtualization.Framework, but
+there are a number of packages, such as `vsudd`, which enable
+tighter integration of the VM with the host (see below).
+
+The Virtualization.Framework backend also allows passing custom userdata into the
+[metadata package](./metadata.md) using either the `-data` or `-data-file` command-line
+option. This attaches a CD device with the data on.
+
+
+### `vsudd` unix domain socket forwarding
+
+The [`vsudd` package](/pkg/vsudd) provides a daemon that exposes unix
+domain socket inside the VM to the host via virtio or Hyper-V sockets.
+With Virtualization.Framework, the virtio sockets can be exposed as unix domain
+sockets on the host, enabling access to other daemons, like
+`containerd` and `dockerd`, from the host.  An example configuration
+file is available in [examples/vsudd-containerd.yml](/examples/vsudd-containerd.yml).
+
+After building the example, run it with `linuxkit run virtualization.framework
+-vsock-ports 2374 vsudd`. This will create a unix domain socket in the state directory that maps to the `containerd` control socket. The socket is called `guest.00000946`.
+
+If you install the `ctr` tool on the host you should be able to access the
+`containerd` running in the VM:
+
+```
+$ go get -u -ldflags -s github.com/containerd/containerd/cmd/ctr
+...
+$ ctr -a vsudd-state/guest.00000946 list
+ID        IMAGE     PID       STATUS
+vsudd               466       RUNNING
+```
